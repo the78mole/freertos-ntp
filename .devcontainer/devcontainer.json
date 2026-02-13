@@ -55,16 +55,17 @@
         "ghcr.io/devcontainers/features/common-utils:2": {
             "installZsh": true,
             "installOhMyZsh": true,
-            "upgradePackages": true,
-            "configureZshAsDefaultShell": true,
-            "username": "vscode",
-            "userUid": "1000",
-            "userGid": "1000"
-        }
+			"upgradePackages": true,
+			"configureZshAsDefaultShell": true,
+			"username": "dev",
+			"userUid": "${localEnv:UID}",
+			"userGid": "${localEnv:UID}",
+		}
     },
 
     // Environment variables
     "containerEnv": {
+        "SSH_AUTH_SOCK": "/ssh-agent",
         "FREERTOS_PATH": "/workspace/FreeRTOS-Kernel",
         "FREERTOS_TCP_PATH": "/workspace/FreeRTOS-Plus-TCP",
         "FREERTOS_PORT": "GCC/Posix"
@@ -84,6 +85,7 @@
 
     // Additional mounts for FreeRTOS
     "mounts": [
+        "source=${localEnv:SSH_AUTH_SOCK},target=/ssh-agent,type=bind",
         "source=freertos-kernel,target=/workspace/FreeRTOS-Kernel,type=volume",
         "source=freertos-tcp,target=/workspace/FreeRTOS-Plus-TCP,type=volume"
     ]

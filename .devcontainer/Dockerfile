@@ -1,54 +1,35 @@
 # Use Ubuntu 24.04 as base image
 FROM ubuntu:24.04
 
-# Prevent interactive prompts during package installation
+ARG USERNAME=dev
+ARG IMG_OLD_USERNAME=ubuntu
+ARG USER_UID=1000
+ARG USER_GID=$USER_UID
+
+ENV TZ=Europe/Berlin
 ENV DEBIAN_FRONTEND=noninteractive
 
 # Update and install essential packages
 RUN apt-get update && apt-get install -y \
     # Build tools
-    build-essential \
-    gcc \
-    g++ \
-    make \
-    cmake \
-    git \
+    build-essential gcc g++ make cmake git \
     # Libraries
-    libssl-dev \
-    libmbedtls-dev \
+    libssl-dev libmbedtls-dev \
     # Debugging and tools
-    gdb \
-    valgrind \
-    strace \
+    gdb valgrind strace \
     # Network tools
-    chrony \
-    net-tools \
-    iputils-ping \
-    tcpdump \
+    chrony net-tools iputils-ping tcpdump \
     # Additional utilities
-    vim \
-    nano \
-    wget \
-    curl \
-    tree \
-    htop \
-    sudo \
+    vim nano wget curl tree htop sudo \
     # Python for scripts
-    python3 \
-    python3-pip \
-    && apt-get clean \
-    && rm -rf /var/lib/apt/lists/*
+    python3 python3-pip && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
 
-# Create a non-root user (vscode)
-ARG USERNAME=vscode
-ARG USER_UID=1000
-ARG USER_GID=$USER_UID
-
-RUN groupadd --gid $USER_GID $USERNAME \
-    && useradd --uid $USER_UID --gid $USER_GID -m $USERNAME \
-    && echo $USERNAME ALL=\(root\) NOPASSWD:ALL > /etc/sudoers.d/$USERNAME \
-    && chmod 0440 /etc/sudoers.d/$USERNAME
-
+RUN usermod -l ${USERNAME} -d /home/${USERNAME} -m ${IMG_OLD_USERNAME} \
+    && groupmod -n ${USERNAME} ${IMG_OLD_USERNAME} && \
+    echo "${USERNAME} ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/${USERNAME} \
+    && chmod 0440 /etc/sudoers.d/${USERNAME}
+    
 # Create directories for FreeRTOS
 RUN mkdir -p /workspace/FreeRTOS-Kernel \
     && mkdir -p /workspace/FreeRTOS-Plus-TCP \
@@ -62,7 +43,7 @@ COPY start-chrony.sh /usr/local/bin/start-chrony.sh
 RUN chmod +x /usr/local/bin/start-chrony.sh
 
 # Expose NTP port
-EXPOSE 123/udp
+#EXPOSE 123/udp
 
 # Set working directory
 WORKDIR /workspaces/freertos-ntp
