@@ -72,6 +72,8 @@ typedef struct {
 /* NTP Client Configuration */
 typedef struct {
     bool     use_sntp_mode;   /* Use simple SNTP mode (no metrics) */
+    bool     use_nts;         /* Use NTS (Network Time Security) */
+    bool     enable_broadcast;/* Enable broadcast mode reception */
     uint16_t port;            /* NTP server port (default 123) */
     uint32_t poll_interval;   /* Poll interval in seconds */
     uint32_t timeout_ms;      /* Response timeout in milliseconds */
@@ -169,6 +171,34 @@ void vNTPStop(NTPTaskHandle_t handle);
  * @param config Pointer to configuration structure to fill
  */
 void vNTPGetDefaultConfig(NTPConfig_t *config);
+
+/**
+ * @brief Enable NTS (Network Time Security) for a server
+ * 
+ * @param handle NTP task handle
+ * @param hostname Server hostname
+ * @param nts_ke_server NTS-KE server hostname (NULL to use same as NTP server)
+ * @param nts_ke_port NTS-KE server port (0 for default 4460)
+ * @return true if NTS enabled successfully, false otherwise
+ */
+bool xNTPEnableNTS(NTPTaskHandle_t handle, const char *hostname, 
+                   const char *nts_ke_server, uint16_t nts_ke_port);
+
+/**
+ * @brief Enable NTP broadcast mode reception
+ * 
+ * @param handle NTP task handle
+ * @param multicast_addr Multicast address (0 for default 224.0.1.1)
+ * @return true if broadcast mode enabled, false otherwise
+ */
+bool xNTPEnableBroadcast(NTPTaskHandle_t handle, uint32_t multicast_addr);
+
+/**
+ * @brief Disable NTP broadcast mode reception
+ * 
+ * @param handle NTP task handle
+ */
+void vNTPDisableBroadcast(NTPTaskHandle_t handle);
 
 #ifdef __cplusplus
 }

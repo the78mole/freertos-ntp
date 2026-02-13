@@ -6,6 +6,8 @@
  */
 
 #include "freertos_ntp.h"
+#include "freertos_ntp_nts.h"
+#include "freertos_ntp_broadcast.h"
 #include "FreeRTOS.h"
 #include "task.h"
 #include "semphr.h"
@@ -15,10 +17,17 @@
 #include <stdio.h>
 #include <math.h>
 
+/* Extended server information with NTS support */
+typedef struct {
+    NTPServerStats_t stats;
+    NTSSession_t nts_session;
+    bool use_nts;
+} NTPServerInfo_t;
+
 /* Internal NTP client context */
 typedef struct {
     NTPConfig_t config;
-    NTPServerStats_t servers[NTP_MAX_SERVERS];
+    NTPServerInfo_t servers[NTP_MAX_SERVERS];
     uint32_t num_servers;
     TaskHandle_t task_handle;
     SemaphoreHandle_t mutex;
@@ -26,6 +35,7 @@ typedef struct {
     NTPTimeSetCallback_t time_callback;
     NTPSkewSetCallback_t skew_callback;
     Socket_t socket;
+    NTPBroadcastContext_t *broadcast_context;
 } NTPContext_t;
 
 /* Helper function to convert NTP timestamp to Unix timestamp */
@@ -90,52 +100,80 @@ static Socket_t prvCreateNTPSocket(uint32_t timeout_ms)
     return sock;
 }
 
-/* Send NTP request and receive response */
-static bool prvQueryNTPServer(Socket_t sock, NTPServerStats_t *server, 
+/* Send NTP request and receive response (with optional NTS) */
+static bool prvQueryNTPServer(Socket_t sock, NTPServerInfo_t *server_info, 
                               uint32_t port, NTPPacket_t *response,
                               uint32_t *t1_sec, uint32_t *t1_us,
                               uint32_t *t4_sec, uint32_t *t4_us)
 {
-    NTPPacket_t request;
+    uint8_t request_buffer[NTP_PACKET_SIZE + 1024];  /* Extra space for NTS extensions */
+    uint8_t response_buffer[NTP_PACKET_SIZE + 1024];
+    NTPPacket_t *request = (NTPPacket_t *)request_buffer;
     struct freertos_sockaddr server_addr;
     int32_t bytes_sent, bytes_received;
+    uint32_t packet_size = NTP_PACKET_SIZE;
     
     /* Get transmit timestamp (t1) */
     prvGetCurrentTime(t1_sec, t1_us);
     
     /* Prepare NTP request packet */
-    memset(&request, 0, sizeof(request));
-    request.li_vn_mode = (NTP_VERSION << 3) | NTP_MODE_CLIENT;
+    memset(request, 0, sizeof(NTPPacket_t));
+    request->li_vn_mode = (NTP_VERSION << 3) | NTP_MODE_CLIENT;
     
     /* Convert t1 to NTP format and set as transmit timestamp */
-    prvUnixToNTPTimestamp(*t1_sec, *t1_us, &request.tx_timestamp_sec, &request.tx_timestamp_frac);
-    request.tx_timestamp_sec = FreeRTOS_htonl(request.tx_timestamp_sec);
-    request.tx_timestamp_frac = FreeRTOS_htonl(request.tx_timestamp_frac);
+    prvUnixToNTPTimestamp(*t1_sec, *t1_us, &request->tx_timestamp_sec, &request->tx_timestamp_frac);
+    request->tx_timestamp_sec = FreeRTOS_htonl(request->tx_timestamp_sec);
+    request->tx_timestamp_frac = FreeRTOS_htonl(request->tx_timestamp_frac);
+    
+    /* Add NTS authentication if enabled */
+    if (server_info->use_nts && server_info->nts_session.initialized) {
+        uint32_t new_size;
+        if (!xNTSAddAuthentication(&server_info->nts_session, request_buffer, 
+                                   packet_size, sizeof(request_buffer), &new_size)) {
+            return false;
+        }
+        packet_size = new_size;
+    }
     
     /* Set up server address */
     memset(&server_addr, 0, sizeof(server_addr));
     server_addr.sin_family = FREERTOS_AF_INET;
-    server_addr.sin_addr = server->ip_address;
+    server_addr.sin_addr = server_info->stats.ip_address;
     server_addr.sin_port = FreeRTOS_htons(port);
     
     /* Send request */
-    bytes_sent = FreeRTOS_sendto(sock, &request, sizeof(request), 0,
+    bytes_sent = FreeRTOS_sendto(sock, request_buffer, packet_size, 0,
                                  &server_addr, sizeof(server_addr));
-    if (bytes_sent != sizeof(request)) {
+    if (bytes_sent != (int32_t)packet_size) {
         return false;
     }
     
     /* Receive response */
     socklen_t addr_len = sizeof(server_addr);
-    bytes_received = FreeRTOS_recvfrom(sock, response, sizeof(NTPPacket_t), 0,
+    bytes_received = FreeRTOS_recvfrom(sock, response_buffer, sizeof(response_buffer), 0,
                                        &server_addr, &addr_len);
     
     /* Get receive timestamp (t4) */
     prvGetCurrentTime(t4_sec, t4_us);
     
-    if (bytes_received != sizeof(NTPPacket_t)) {
+    if (bytes_received < (int32_t)sizeof(NTPPacket_t)) {
         return false;
     }
+    
+    /* Verify NTS authentication if enabled */
+    if (server_info->use_nts && server_info->nts_session.initialized) {
+        if (!xNTSVerifyAuthentication(&server_info->nts_session, response_buffer, 
+                                      (uint32_t)bytes_received)) {
+            return false;
+        }
+        
+        /* Extract new cookies */
+        ulNTSExtractCookies(&server_info->nts_session, response_buffer, 
+                           (uint32_t)bytes_received);
+    }
+    
+    /* Copy NTP packet from response buffer */
+    memcpy(response, response_buffer, sizeof(NTPPacket_t));
     
     /* Convert network byte order to host byte order */
     response->root_delay = FreeRTOS_ntohl(response->root_delay);
@@ -236,7 +274,13 @@ static void prvNTPTask(void *pvParameters)
         bool found_best = false;
         
         for (uint32_t i = 0; i < ctx->num_servers && active_count < NTP_MAX_ACTIVE_SERVERS; i++) {
-            if (!(ctx->servers[i].flags & NTP_SERVER_FLAG_ACTIVE)) {
+            if (!(ctx->servers[i].stats.flags & NTP_SERVER_FLAG_ACTIVE)) {
+                continue;
+            }
+            
+            /* Refresh NTS session if needed */
+            if (ctx->servers[i].use_nts && xNTSNeedsRefresh(&ctx->servers[i].nts_session)) {
+                /* NTS session needs refresh - will happen in next iteration */
                 continue;
             }
             
@@ -258,29 +302,29 @@ static void prvNTPTask(void *pvParameters)
                         ctx->time_callback(server_sec, server_us);
                     }
                     
-                    ctx->servers[i].reach = (ctx->servers[i].reach << 1) | 1;
-                    ctx->servers[i].flags |= NTP_SERVER_FLAG_REACHABLE;
-                    ctx->servers[i].last_update = t4_sec;
+                    ctx->servers[i].stats.reach = (ctx->servers[i].stats.reach << 1) | 1;
+                    ctx->servers[i].stats.flags |= NTP_SERVER_FLAG_REACHABLE;
+                    ctx->servers[i].stats.last_update = t4_sec;
                 } else {
                     /* Full NTP mode: calculate metrics */
-                    prvCalculateNTPMetrics(&ctx->servers[i], &response, t1_sec, t1_us, t4_sec, t4_us);
+                    prvCalculateNTPMetrics(&ctx->servers[i].stats, &response, t1_sec, t1_us, t4_sec, t4_us);
                     
                     /* Select best server (lowest jitter and valid) */
                     if (!found_best || 
-                        (ctx->servers[i].jitter_us < best_offset && 
-                         (ctx->servers[i].flags & NTP_SERVER_FLAG_VALID))) {
-                        best_offset = ctx->servers[i].offset_us;
+                        (ctx->servers[i].stats.jitter_us < best_offset && 
+                         (ctx->servers[i].stats.flags & NTP_SERVER_FLAG_VALID))) {
+                        best_offset = ctx->servers[i].stats.offset_us;
                         found_best = true;
-                        ctx->servers[i].flags |= NTP_SERVER_FLAG_SELECTED;
+                        ctx->servers[i].stats.flags |= NTP_SERVER_FLAG_SELECTED;
                     } else {
-                        ctx->servers[i].flags &= ~NTP_SERVER_FLAG_SELECTED;
+                        ctx->servers[i].stats.flags &= ~NTP_SERVER_FLAG_SELECTED;
                     }
                 }
             } else {
                 /* Query failed - update reachability */
-                ctx->servers[i].reach <<= 1;
-                if (ctx->servers[i].reach == 0) {
-                    ctx->servers[i].flags &= ~NTP_SERVER_FLAG_REACHABLE;
+                ctx->servers[i].stats.reach <<= 1;
+                if (ctx->servers[i].stats.reach == 0) {
+                    ctx->servers[i].stats.flags &= ~NTP_SERVER_FLAG_REACHABLE;
                 }
             }
         }
@@ -325,6 +369,8 @@ void vNTPGetDefaultConfig(NTPConfig_t *config)
     configASSERT(config != NULL);
     
     config->use_sntp_mode = false;
+    config->use_nts = false;
+    config->enable_broadcast = false;
     config->port = NTP_DEFAULT_PORT;
     config->poll_interval = 64;  /* 64 seconds default */
     config->timeout_ms = 5000;   /* 5 second timeout */
@@ -356,6 +402,12 @@ NTPTaskHandle_t xNTPClientInit(const NTPConfig_t *config)
     
     ctx->socket = FREERTOS_INVALID_SOCKET;
     ctx->running = false;
+    ctx->broadcast_context = NULL;
+    
+    /* Initialize broadcast mode if enabled */
+    if (config->enable_broadcast) {
+        ctx->broadcast_context = xNTPBroadcastInit(0, 0);  /* Use defaults */
+    }
     
     return (NTPTaskHandle_t)ctx;
 }
@@ -384,13 +436,14 @@ bool xNTPAddServer(NTPTaskHandle_t handle, const char *hostname)
     }
     
     /* Add server to list */
-    NTPServerStats_t *server = &ctx->servers[ctx->num_servers];
-    memset(server, 0, sizeof(NTPServerStats_t));
-    strncpy(server->hostname, hostname, sizeof(server->hostname) - 1);
-    server->hostname[sizeof(server->hostname) - 1] = '\0';
-    server->ip_address = ip_addr;
-    server->flags = NTP_SERVER_FLAG_ACTIVE;
-    server->poll_interval = ctx->config.poll_interval;
+    NTPServerInfo_t *server_info = &ctx->servers[ctx->num_servers];
+    memset(server_info, 0, sizeof(NTPServerInfo_t));
+    strncpy(server_info->stats.hostname, hostname, sizeof(server_info->stats.hostname) - 1);
+    server_info->stats.hostname[sizeof(server_info->stats.hostname) - 1] = '\0';
+    server_info->stats.ip_address = ip_addr;
+    server_info->stats.flags = NTP_SERVER_FLAG_ACTIVE;
+    server_info->stats.poll_interval = ctx->config.poll_interval;
+    server_info->use_nts = false;
     
     ctx->num_servers++;
     
@@ -411,10 +464,15 @@ bool xNTPRemoveServer(NTPTaskHandle_t handle, const char *hostname)
     
     /* Find and remove server */
     for (uint32_t i = 0; i < ctx->num_servers; i++) {
-        if (strcmp(ctx->servers[i].hostname, hostname) == 0) {
+        if (strcmp(ctx->servers[i].stats.hostname, hostname) == 0) {
+            /* Clean up NTS session if active */
+            if (ctx->servers[i].use_nts) {
+                vNTSCleanupSession(&ctx->servers[i].nts_session);
+            }
+            
             /* Shift remaining servers down */
             for (uint32_t j = i; j < ctx->num_servers - 1; j++) {
-                memcpy(&ctx->servers[j], &ctx->servers[j + 1], sizeof(NTPServerStats_t));
+                memcpy(&ctx->servers[j], &ctx->servers[j + 1], sizeof(NTPServerInfo_t));
             }
             ctx->num_servers--;
             xSemaphoreGive(ctx->mutex);
@@ -464,7 +522,9 @@ uint32_t ulNTPGetServerStats(NTPTaskHandle_t handle, NTPServerStats_t *stats, ui
     xSemaphoreTake(ctx->mutex, portMAX_DELAY);
     
     count = ctx->num_servers < max_servers ? ctx->num_servers : max_servers;
-    memcpy(stats, ctx->servers, count * sizeof(NTPServerStats_t));
+    for (uint32_t i = 0; i < count; i++) {
+        memcpy(&stats[i], &ctx->servers[i].stats, sizeof(NTPServerStats_t));
+    }
     
     xSemaphoreGive(ctx->mutex);
     
@@ -489,8 +549,13 @@ uint32_t ulNTPGetStatusString(NTPTaskHandle_t handle, char *buffer, uint32_t buf
                       "==============================================================================\n");
     
     for (uint32_t i = 0; i < ctx->num_servers && offset < buffer_size - 80; i++) {
-        NTPServerStats_t *s = &ctx->servers[i];
+        NTPServerStats_t *s = &ctx->servers[i].stats;
         char marker = ' ';
+        char type_marker = 'u';  /* u=unicast, b=broadcast, s=NTS */
+        
+        if (ctx->servers[i].use_nts) {
+            type_marker = 's';
+        }
         
         if (s->flags & NTP_SERVER_FLAG_SELECTED) {
             marker = '*';
@@ -513,8 +578,8 @@ uint32_t ulNTPGetStatusString(NTPTaskHandle_t handle, char *buffer, uint32_t buf
                 (s->ref_id >> 8) & 0xFF, s->ref_id & 0xFF);
         
         offset += snprintf(buffer + offset, buffer_size - offset,
-                          "%c%-15s %-15s %2u u %4u %4u  %3o  %6d  %6d  %6d\n",
-                          marker, s->hostname, ref_str, s->stratum,
+                          "%c%-15s %-15s %2u %c %4u %4u  %3o  %6d  %6d  %6d\n",
+                          marker, s->hostname, ref_str, s->stratum, type_marker,
                           when, s->poll_interval, s->reach,
                           s->delay_us / 1000, s->offset_us / 1000, s->jitter_us / 1000);
     }
@@ -543,6 +608,13 @@ bool xNTPStart(NTPTaskHandle_t handle)
         return false;
     }
     
+    /* Start broadcast receiver if enabled */
+    if (ctx->broadcast_context != NULL) {
+        if (!xNTPBroadcastStart(ctx->broadcast_context)) {
+            /* Broadcast start failed, but continue anyway */
+        }
+    }
+    
     return true;
 }
 
@@ -556,6 +628,97 @@ void vNTPStop(NTPTaskHandle_t handle)
     
     ctx->running = false;
     
+    /* Stop broadcast receiver if running */
+    if (ctx->broadcast_context != NULL) {
+        vNTPBroadcastStop(ctx->broadcast_context);
+    }
+    
     /* Wait for task to terminate */
     vTaskDelay(pdMS_TO_TICKS(100));
+}
+
+/* New API functions for NTS and broadcast */
+
+bool xNTPEnableNTS(NTPTaskHandle_t handle, const char *hostname,
+                   const char *nts_ke_server, uint16_t nts_ke_port)
+{
+    NTPContext_t *ctx = (NTPContext_t *)handle;
+    
+    if (ctx == NULL || hostname == NULL) {
+        return false;
+    }
+    
+    xSemaphoreTake(ctx->mutex, portMAX_DELAY);
+    
+    /* Find server by hostname */
+    for (uint32_t i = 0; i < ctx->num_servers; i++) {
+        if (strcmp(ctx->servers[i].stats.hostname, hostname) == 0) {
+            const char *ke_server = nts_ke_server ? nts_ke_server : hostname;
+            uint16_t ke_port = nts_ke_port ? nts_ke_port : NTS_KE_DEFAULT_PORT;
+            
+            /* Initialize NTS session */
+            if (xNTSInitSession(&ctx->servers[i].nts_session, ke_server, ke_port)) {
+                ctx->servers[i].use_nts = true;
+                xSemaphoreGive(ctx->mutex);
+                return true;
+            }
+            
+            xSemaphoreGive(ctx->mutex);
+            return false;
+        }
+    }
+    
+    xSemaphoreGive(ctx->mutex);
+    return false;
+}
+
+bool xNTPEnableBroadcast(NTPTaskHandle_t handle, uint32_t multicast_addr)
+{
+    NTPContext_t *ctx = (NTPContext_t *)handle;
+    
+    if (ctx == NULL) {
+        return false;
+    }
+    
+    xSemaphoreTake(ctx->mutex, portMAX_DELAY);
+    
+    /* Create broadcast context if not already created */
+    if (ctx->broadcast_context == NULL) {
+        ctx->broadcast_context = xNTPBroadcastInit(multicast_addr, 0);
+        if (ctx->broadcast_context == NULL) {
+            xSemaphoreGive(ctx->mutex);
+            return false;
+        }
+        
+        /* If NTP is already running, start broadcast receiver */
+        if (ctx->running) {
+            if (!xNTPBroadcastStart(ctx->broadcast_context)) {
+                vNTPBroadcastCleanup(ctx->broadcast_context);
+                ctx->broadcast_context = NULL;
+                xSemaphoreGive(ctx->mutex);
+                return false;
+            }
+        }
+    }
+    
+    xSemaphoreGive(ctx->mutex);
+    return true;
+}
+
+void vNTPDisableBroadcast(NTPTaskHandle_t handle)
+{
+    NTPContext_t *ctx = (NTPContext_t *)handle;
+    
+    if (ctx == NULL) {
+        return;
+    }
+    
+    xSemaphoreTake(ctx->mutex, portMAX_DELAY);
+    
+    if (ctx->broadcast_context != NULL) {
+        vNTPBroadcastCleanup(ctx->broadcast_context);
+        ctx->broadcast_context = NULL;
+    }
+    
+    xSemaphoreGive(ctx->mutex);
 }
