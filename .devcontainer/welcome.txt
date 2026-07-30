@@ -1,0 +1,74 @@
+╔══════════════════════════════════════════════════════════════════════════════╗
+║ ⌚⌚⌚⌚⌚        FreeRTOS NTP Development Container         ⌚⌚⌚⌚⌚ ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+📋 START CHRONY NTP SERVER
+────────────────────────────────────────────────────────────────────────────────
+
+  Start Chrony server:
+    $ .devcontainer/start-chrony.sh
+
+  Check server status:
+    $ chronyc tracking
+    $ chronyc sources
+
+  Server runs on: localhost:123 (UDP)
+
+
+⚙️  FREERTOS NTP CLIENT CONFIGURATION
+────────────────────────────────────────────────────────────────────────────────
+
+  In your FreeRTOS application (e.g. examples/x86_test/main.c):
+
+  1. Set NTP server address:
+     
+     NTPTaskConfig_t xNTPConfig = {
+         .pcNTPServer = "127.0.0.1",  // Local Chrony server
+         .usNTPPort = 123,
+         // ... additional configuration
+     };
+
+  2. Or use hostname:
+     
+     .pcNTPServer = "localhost",
+
+  3. For external tests (pool servers):
+     
+     .pcNTPServer = "pool.ntp.org",
+
+
+🔧 USEFUL COMMANDS
+────────────────────────────────────────────────────────────────────────────────
+
+  Build project:
+    $ make
+
+  Compile example (with Make):
+    $ cd examples/x86_test && make
+
+  Compile example (with CMake):
+    $ mkdir -p build && cd build
+    $ cmake .. -DFREERTOS_KERNEL_PATH=/workspace/FreeRTOS-Kernel \
+               -DFREERTOS_PLUS_TCP_PATH=/workspace/FreeRTOS-Plus-TCP \
+               -DFREERTOS_PORT=GCC/Posix -DBUILD_NTP_EXAMPLE=ON
+    $ make
+
+  Run example:
+    $ cd examples/x86_test && ./ntp_test
+
+  Test NTP query:
+    $ sudo apt-get install -y ntpdate
+    $ ntpdate -q localhost
+
+
+📚 FURTHER INFORMATION
+────────────────────────────────────────────────────────────────────────────────
+
+  Example documentation: examples/x86_test/README.md
+  DevContainer setup: .devcontainer/README.md
+  API documentation: API.md
+  Quick start guide: QUICKSTART.md
+
+╔══════════════════════════════════════════════════════════════════════════════╗
+║                         Happy Coding! 🚀                                     ║
+╚══════════════════════════════════════════════════════════════════════════════╝
